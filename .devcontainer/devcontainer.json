@@ -1,0 +1,15 @@
+{
+    "name": "Mobile-O Environment",
+    "image": "pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime",
+    "runArgs": [
+        "--gpus", "all",
+        "-p", "8010:8010"
+    ],
+    "postStartCommand": "",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+            ]
+        }
+    }
+}

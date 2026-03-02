@@ -1,0 +1,43 @@
+services:
+  api-server:
+    image: mobile-o-api:latest
+    container_name: mobile-o-api-server
+    ports:
+      - "8010:8010"
+    volumes:
+      - .:/workspaces/mobile-o-inference
+    working_dir: /workspaces/mobile-o-inference
+    entrypoint: []
+    command: python api_image_understanding.py --model_path checkpoints/final_merged_model_23620 --port 8010
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 180s   # model loading can take a few minutes
+
+  gpu-worker:
+    image: mobile-o-api:latest
+    container_name: mobile-o-gpu-worker
+    volumes:
+      - .:/workspaces/mobile-o-inference
+    working_dir: /workspaces/mobile-o-inference
+    entrypoint: []
+    command: python gpu_worker.py --api_url http://api-server:8010
+    environment:
+      - REDIS_ACCESS_KEY=${REDIS_ACCESS_KEY:}
+      - REDIS_HOST=${REDIS_HOST:}
+      - REDIS_PORT=${REDIS_PORT:-10000}
+    depends_on:
+      api-server:
+        condition: service_healthy
+    restart: unless-stopped

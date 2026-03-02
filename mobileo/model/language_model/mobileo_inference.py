@@ -43,7 +43,6 @@ class mobileoForInferenceLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        self.to(torch.float32)
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:

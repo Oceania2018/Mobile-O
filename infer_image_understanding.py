@@ -13,8 +13,27 @@ from argparse import ArgumentParser
 parser = ArgumentParser()
 parser.add_argument("--model_path", type=str, default="checkpoints/mobileo_unified_1.5B")
 parser.add_argument("--image_path", type=str, default="assets/funny_image.jpeg")
-parser.add_argument("--prompt", type=str, default="Caption the image please")
+parser.add_argument(
+    "--mode",
+    type=str,
+    choices=["caption", "description", "prompt"],
+    default="caption",
+    help="caption: Caption the image | description: Describe the image | prompt: provide custom text via --text",
+)
+parser.add_argument("--text", type=str, default="", help="Custom prompt text, used when --mode=prompt")
 args = parser.parse_args()
+
+MODE_PROMPTS = {
+    "caption": "Caption the image",
+    "description": "Describe the image",
+}
+
+if args.mode == "prompt":
+    if not args.text:
+        parser.error("--text is required when --mode=prompt")
+    user_prompt = args.text
+else:
+    user_prompt = MODE_PROMPTS[args.mode]
 
 disable_torch_init()
 tokenizer, model, _ = load_pretrained_model(args.model_path)
@@ -22,7 +41,7 @@ model.to(torch.bfloat16).to("cuda:0")
 
 image_processor = model.get_vision_tower().image_processor
 
-qs = DEFAULT_IMAGE_TOKEN + "\n" + args.prompt
+qs = DEFAULT_IMAGE_TOKEN + "\n" + user_prompt
 conv = conv_templates["qwen_2"].copy()
 conv.append_message(conv.roles[0], qs)
 conv.append_message(conv.roles[1], None)
