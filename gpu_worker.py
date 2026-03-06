@@ -56,14 +56,14 @@ from redis.cluster import RedisCluster
 # CLI arguments
 # ---------------------------------------------------------------------------
 parser = ArgumentParser()
-parser.add_argument("--api_url", type=str, default="http://localhost:8010",
+parser.add_argument("--api_url", type=str, default=os.environ.get("API_URL", "http://localhost:8010"),
                     help="Base URL of the running api_image_understanding.py server")
 parser.add_argument("--api_timeout", type=float, default=60.0,
                     help="HTTP timeout in seconds when calling the API server")
 parser.add_argument("--redis_host", type=str, default=os.environ.get("REDIS_HOST", "rpc.centralus.redis.azure.net"))
 parser.add_argument("--redis_port", type=int, default=int(os.environ.get("REDIS_PORT", "10000")))
 parser.add_argument("--redis_db",   type=int, default=0)
-parser.add_argument("--queue_name", type=str, default="gpu_tasks:image_understand",
+parser.add_argument("--queue_name", type=str, default="ai_tasks:image_understand",
                     help="Redis List key to BRPOP from (must match C# TaskQueueName)")
 parser.add_argument("--result_channel_prefix", type=str, default="result",
                     help="Pub/Sub channel prefix; result published to <prefix>:<taskId>")
@@ -256,12 +256,23 @@ def _connect_redis():
         # only valid for the public hostname.  address_remap redirects every
         # node address back to the public endpoint so all traffic goes through
         # the one host whose cert IS valid.
+        import ssl
         public_addr = (args.redis_host, args.redis_port)
+        
+        # Create SSL context that skips hostname verification for internal IPs
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        
         return RedisCluster(
             host=args.redis_host,
             port=args.redis_port,
             password=REDIS_ACCESS_KEY or None,
-            ssl=REDIS_SSL,
+            ssl=True,
+            ssl_certfile=None,
+            ssl_keyfile=None,
+            ssl_ca_certs=None,
+            ssl_check_hostname=False,
             decode_responses=True,
             skip_full_coverage_check=True,
             address_remap=lambda _addr: public_addr,
@@ -272,6 +283,10 @@ def _connect_redis():
         db=args.redis_db,
         password=REDIS_ACCESS_KEY or None,
         ssl=REDIS_SSL,
+        ssl_check_hostname=False,
+        ssl_certfile=None,
+        ssl_keyfile=None,
+        ssl_ca_certs=None,
         decode_responses=True,
     )
 

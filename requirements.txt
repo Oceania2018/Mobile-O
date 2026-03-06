@@ -34,4 +34,4 @@ tabulate
 ninja
 qwen_vl_utils
 huggingface_hub
-wandb
+wandbredis

@@ -32,10 +32,11 @@ services:
       - .:/workspaces/mobile-o-inference
     working_dir: /workspaces/mobile-o-inference
     entrypoint: []
-    command: python gpu_worker.py --api_url http://api-server:8010
+    command: python gpu_worker.py
     environment:
-      - REDIS_ACCESS_KEY=${REDIS_ACCESS_KEY:}
-      - REDIS_HOST=${REDIS_HOST:}
+      - API_URL=http://api-server:8010
+      - REDIS_ACCESS_KEY=${REDIS_ACCESS_KEY:-}
+      - REDIS_HOST=${REDIS_HOST:-rpc.centralus.redis.azure.net}
       - REDIS_PORT=${REDIS_PORT:-10000}
     depends_on:
       api-server:
