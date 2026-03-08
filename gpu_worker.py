@@ -1,12 +1,7 @@
-"""GPU Worker: Redis queue → HTTP API bridge for Mobile-O image understanding.
+"""GPU Worker: Redis queue → model inference for Mobile-O image understanding.
 
-Receives tasks from a Redis List (BRPOP), forwards them to the running
-api_image_understanding.py FastAPI server via HTTP, and publishes results
-back via Redis Pub/Sub – matching the protocol defined in
-docs/gpu-rpc-integration.md.
-
-The model is loaded only once (inside api_image_understanding.py), so both
-processes can run simultaneously without doubling GPU memory usage.
+Receives tasks from a Redis List (BRPOP), runs model inference directly,
+and publishes results back via Redis Pub/Sub.
 
 Incoming task message (JSON pushed by C# RedisRpcService):
     {
@@ -26,14 +21,11 @@ Result message published to  result:<taskId>:
     { "status": "error",   "error": "..." }
 
 Usage:
-    # Terminal 1 – model server
-    python api_image_understanding.py --model_path checkpoints/final_merged_model_23620
-
-    # Terminal 2 – Redis worker (no GPU required here)
-    python gpu_worker.py
+    python gpu_worker.py --model_path checkpoints/final_merged_model_23620
 
     # Azure Redis (SSL):
     REDIS_ACCESS_KEY=<key> python gpu_worker.py \\
+        --model_path checkpoints/final_merged_model_23620 \\
         --redis_host rpc.centralus.redis.azure.net --redis_port 10000
 """
 
@@ -42,24 +34,39 @@ import io
 import json
 import os
 import signal
-import subprocess
-import sys
 import time
+import warnings
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List
 
 import httpx
 import redis
+import torch
+from PIL import Image
 from redis.cluster import RedisCluster
+from transformers import AutoTokenizer
+
+from mobileo.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN,
+                                DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN,
+                                IMAGE_TOKEN_INDEX)
+from mobileo.conversation import conv_templates
+from mobileo.mm_utils import process_images, tokenizer_image_token
+from mobileo.model import mobileoForInferenceLM
+from mobileo.utils import disable_torch_init
 
 # ---------------------------------------------------------------------------
 # CLI arguments
 # ---------------------------------------------------------------------------
 parser = ArgumentParser()
-parser.add_argument("--api_url", type=str, default=os.environ.get("API_URL", "http://localhost:8010"),
-                    help="Base URL of the running api_image_understanding.py server")
-parser.add_argument("--api_timeout", type=float, default=60.0,
-                    help="HTTP timeout in seconds when calling the API server")
+# Model
+parser.add_argument("--model_path", type=str, default="checkpoints/final_merged_model_23620")
+parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+parser.add_argument("--mode", type=str, choices=["caption", "description", "prompt"], default="caption",
+                    help="Default inference mode when task does not specify one")
+parser.add_argument("--temperature", type=float, default=0.0)
+parser.add_argument("--max_new_tokens", type=int, default=64)
+# Redis
 parser.add_argument("--redis_host", type=str, default=os.environ.get("REDIS_HOST", "rpc.centralus.redis.azure.net"))
 parser.add_argument("--redis_port", type=int, default=int(os.environ.get("REDIS_PORT", "10000")))
 parser.add_argument("--redis_db",   type=int, default=0)
@@ -67,29 +74,143 @@ parser.add_argument("--queue_name", type=str, default="ai_tasks:image_understand
                     help="Redis List key to BRPOP from (must match C# TaskQueueName)")
 parser.add_argument("--result_channel_prefix", type=str, default="result",
                     help="Pub/Sub channel prefix; result published to <prefix>:<taskId>")
-# Auto-start API server options
-parser.add_argument("--auto_start_api", action="store_true",
-                    help="Automatically launch api_image_understanding.py as a subprocess")
-parser.add_argument("--model_path", type=str, default="checkpoints/final_merged_model_23620",
-                    help="Model path forwarded to api_image_understanding.py (only used with --auto_start_api)")
-parser.add_argument("--api_ready_timeout", type=float, default=300.0,
-                    help="Seconds to wait for the API server to become healthy (only used with --auto_start_api)")
-parser.add_argument("--redis_cluster", action="store_true",
-                    help="Connect using RedisCluster client (required when Redis runs in Cluster mode, e.g. Azure Redis Cluster)")
+parser.add_argument("--redis_cluster", action="store_true", default=True,
+                    help="Connect using RedisCluster client (required for Azure Redis Cluster)")
 args = parser.parse_args()
 
 REDIS_ACCESS_KEY = os.environ.get("REDIS_ACCESS_KEY", "")
 REDIS_SSL = bool(REDIS_ACCESS_KEY)
 
 # ---------------------------------------------------------------------------
-# Task handler – delegates to api_image_understanding.py via HTTP
+# Model loading
+# ---------------------------------------------------------------------------
+DEVICE = args.device
+if DEVICE == "cuda" and not torch.cuda.is_available():
+    print("WARNING: CUDA not available, falling back to CPU.")
+    DEVICE = "cpu"
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+print(f"Loading model from {args.model_path} (device={DEVICE}, dtype={DTYPE}) ...")
+disable_torch_init()
+warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
+
+tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+model = mobileoForInferenceLM.from_pretrained(
+    args.model_path,
+    low_cpu_mem_usage=True,
+    torch_dtype=DTYPE,
+    device_map=DEVICE if DEVICE == "cpu" else "auto",
+)
+mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+if mm_use_im_patch_token:
+    tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+if mm_use_im_start_end:
+    tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+model.resize_token_embeddings(len(tokenizer))
+model.eval()
+model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+image_processor = model.get_vision_tower().image_processor
+
+MODE_PROMPTS = {
+    "caption":     "Caption this image in under 16 words.",
+    "description": "Describe the image in under 32 words.",
+}
+
+
+def _build_input_ids(text: str):
+    qs = DEFAULT_IMAGE_TOKEN + "\n" + text
+    conv = conv_templates["qwen_2"].copy()
+    conv.append_message(conv.roles[0], qs)
+    conv.append_message(conv.roles[1], None)
+    full_prompt = conv.get_prompt()
+    return (
+        tokenizer_image_token(full_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+        .unsqueeze(0)
+        .to(DEVICE)
+    )
+
+
+print("Pre-compiling fixed prompts ...")
+_cached_input_ids_map = {}
+for _m, _p in MODE_PROMPTS.items():
+    _cached_input_ids_map[_m] = _build_input_ids(_p)
+    print(f"  [{_m}] pre-compiled: {_cached_input_ids_map[_m].shape[1]} tokens")
+
+_decode_executor = ThreadPoolExecutor(max_workers=min((os.cpu_count() or 4), 8))
+
+# Warmup pass
+print("Running warmup pass ...")
+_warmup_image = Image.new("RGB", (336, 336), color=(128, 128, 128))
+_warmup_img = process_images([_warmup_image], image_processor, model.config)[0]
+with torch.inference_mode():
+    model.generate(
+        _cached_input_ids_map["caption"],
+        images=_warmup_img.unsqueeze(0).to(DTYPE),
+        do_sample=False,
+        num_beams=1,
+        max_new_tokens=8,
+        use_cache=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+del _warmup_image, _warmup_img
+print("Model ready.")
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+def _run_inference(images: List[Image.Image], temperature: float, max_new_tokens: int, input_ids) -> List[str]:
+    gen_kwargs = dict(
+        do_sample=temperature > 0,
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=None,
+        num_beams=1,
+        max_new_tokens=max_new_tokens,
+        use_cache=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+
+    image_tensors = process_images(images, image_processor, model.config)
+
+    # Batch path: process_images returned a single [N, C, H, W] tensor
+    if isinstance(image_tensors, torch.Tensor) and image_tensors.dim() == 4:
+        batched_input_ids = input_ids.repeat(len(images), 1)
+        with torch.inference_mode():
+            output_ids = model.generate(batched_input_ids, images=image_tensors.to(DTYPE), **gen_kwargs)
+        return [s.strip() for s in tokenizer.batch_decode(output_ids, skip_special_tokens=True)]
+
+    # Fallback: anyres returned tensors with different shapes (different patch counts).
+    # Resize all images to the processor's fixed crop size so shapes unify, then retry batch.
+    target_size = image_processor.crop_size["height"]
+    resized_images = [img.resize((target_size, target_size), Image.BICUBIC) for img in images]
+    image_tensors = process_images(resized_images, image_processor, model.config)
+
+    if isinstance(image_tensors, torch.Tensor) and image_tensors.dim() == 4:
+        batched_input_ids = input_ids.repeat(len(images), 1)
+        with torch.inference_mode():
+            output_ids = model.generate(batched_input_ids, images=image_tensors.to(DTYPE), **gen_kwargs)
+        return [s.strip() for s in tokenizer.batch_decode(output_ids, skip_special_tokens=True)]
+
+    # Last resort: loop (should not normally be reached)
+    results = []
+    tensor_list = image_tensors if isinstance(image_tensors, list) else [image_tensors[i] for i in range(len(images))]
+    for img_tensor in tensor_list:
+        with torch.inference_mode():
+            output_ids = model.generate(input_ids, images=img_tensor.unsqueeze(0).to(DTYPE), **gen_kwargs)
+        results.append(tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip())
+    return results
+
+# ---------------------------------------------------------------------------
+# Image resolution helpers (base64 / data URI / URL)
 # ---------------------------------------------------------------------------
 def _is_url(s: str) -> bool:
     return s.lower().startswith(("http://", "https://"))
 
 
 def _decode_b64_entry(entry: str) -> bytes:
-    """Decode a raw base64 string or data URI to bytes."""
     if entry.startswith("data:"):
         _, b64data = entry.split(",", 1)
     else:
@@ -98,43 +219,43 @@ def _decode_b64_entry(entry: str) -> bytes:
 
 
 def _fetch_url_bytes(url: str) -> bytes:
-    """Fetch image bytes from an HTTP/HTTPS URL synchronously."""
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         response = client.get(url)
     response.raise_for_status()
     return response.content
 
 
-def _resolve_image_entry(args: tuple) -> tuple:
-    """Fetch or decode a single image entry; returns (index, bytes)."""
-    i, entry = args
+def _resolve_image_entry(entry_tuple: tuple) -> tuple:
+    i, entry = entry_tuple
     entry = str(entry).strip()
     if _is_url(entry):
         return i, _fetch_url_bytes(entry)
     return i, _decode_b64_entry(entry)
 
 
-def handle_image_understand(task_args: dict) -> dict:
-    """Handler for task "image-understand".
+def _decode_pil(image_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    Forwards the request to the running FastAPI server at args.api_url.
-    Accepted keys in task_args:
-        images         – list of image sources: base64, data URI, or HTTP(S) URL (required)
-        mode           – "caption" | "description" | "prompt" (default: "caption")
-        text           – custom prompt text, required when mode="prompt"
-        temperature    – float (optional)
-        max_new_tokens – int   (optional)
-    """
+# ---------------------------------------------------------------------------
+# Task handler
+# ---------------------------------------------------------------------------
+VALID_MODES = {"caption", "description", "prompt"}
+
+
+def handle_image_understand(task_args: dict) -> dict:
     images_list = task_args.get("images")
     if not images_list:
         return {"status": "error", "error": "Missing 'images' in args. Provide a list of base64, data URI, or URL strings."}
     if not isinstance(images_list, list):
-        images_list = [images_list]  # accept a bare string for convenience
+        images_list = [images_list]
 
-    # Resolve each entry to bytes in parallel (URL downloads + base64 decodes)
     n = len(images_list)
     resolved: dict[int, bytes] = {}
     errors: dict[int, dict] = {}
+
+    t_img_start = time.perf_counter()
+
+    # Resolve entries (URL fetch or base64 decode) in parallel
     with ThreadPoolExecutor(max_workers=min(n, 8)) as pool:
         future_to_idx = {
             pool.submit(_resolve_image_entry, (i, entry)): i
@@ -152,44 +273,55 @@ def handle_image_understand(task_args: dict) -> dict:
                 errors[i] = {"status": "error", "error": f"Invalid image at images[{i}]: {exc}"}
 
     if errors:
-        return errors[min(errors)]  # return the first error (lowest index)
+        return errors[min(errors)]
 
-    files = [("images", (f"image_{i}.jpg", io.BytesIO(resolved[i]), "image/jpeg")) for i in range(n)]
+    # Decode PIL images in parallel
+    decode_futures = {_decode_executor.submit(_decode_pil, resolved[i]): i for i in range(n)}
+    pil_images: List[Image.Image] = [None] * n
+    for future in as_completed(decode_futures):
+        i = decode_futures[future]
+        try:
+            pil_images[i] = future.result()
+        except Exception as exc:
+            return {"status": "error", "error": f"Invalid image bytes at images[{i}]: {exc}"}
 
-    # Optional scalar fields
-    form_data: dict = {}
-    for key in ("mode", "text", "temperature", "max_new_tokens"):
-        val = task_args.get(key)
-        if val is not None:
-            form_data[key] = str(val)
+    t_img_elapsed = round(time.perf_counter() - t_img_start, 3)
 
+    # Resolve mode / input_ids
+    temperature    = float(task_args.get("temperature", args.temperature))
+    max_new_tokens = int(task_args.get("max_new_tokens", args.max_new_tokens))
+    mode = task_args.get("mode", args.mode)
+    if mode not in VALID_MODES:
+        return {"status": "error", "error": f"Invalid mode '{mode}'. Must be one of: {sorted(VALID_MODES)}."}
+
+    if mode == "prompt":
+        text = task_args.get("text", "")
+        if not text:
+            return {"status": "error", "error": "'text' is required when mode=prompt."}
+        input_ids = _build_input_ids(text)
+    else:
+        input_ids = _cached_input_ids_map[mode]
+
+    t_infer_start = time.perf_counter()
     try:
-        with httpx.Client(timeout=args.api_timeout) as client:
-            response = client.post(
-                f"{args.api_url}/understand",
-                files=files,
-                data=form_data,
-            )
-        response.raise_for_status()
-        return {"status": "success", "data": response.json()}
-    except httpx.ConnectError:
-        msg = (f"Cannot connect to API server at {args.api_url}. "
-               "Is api_image_understanding.py running?")
-        print(f"  [ConnectError] {msg}")
-        return {"status": "error", "error": msg}
-    except httpx.HTTPStatusError as exc:
-        msg = f"API error {exc.response.status_code}: {exc.response.text}"
-        print(f"  [HTTP error] {msg}")
-        return {"status": "error", "error": msg}
-    except httpx.TimeoutException:
-        msg = f"API timeout after {args.api_timeout}s  (url={args.api_url}/understand)"
-        print(f"  [Timeout] {msg}")
-        return {"status": "error", "error": msg}
+        responses = _run_inference(pil_images, temperature, max_new_tokens, input_ids)
     except Exception as exc:
         import traceback
-        print(f"  [Exception in handle_image_understand] {type(exc).__name__}: {exc}")
+        print(f"  [inference error] {type(exc).__name__}: {exc}")
         print(traceback.format_exc())
         return {"status": "error", "error": str(exc)}
+    t_infer_elapsed = round(time.perf_counter() - t_infer_start, 3)
+
+    print(f"  image_decode={t_img_elapsed}s  inference={t_infer_elapsed}s  results={responses}")
+    return {
+        "status": "success",
+        "data": {
+            "responses": responses,
+            "elapsed_seconds": round(t_img_elapsed + t_infer_elapsed, 3),
+            "image_decode_seconds": t_img_elapsed,
+            "inference_seconds": t_infer_elapsed,
+        },
+    }
 
 
 # Registry – add new handlers here as the system grows
@@ -197,73 +329,15 @@ TASK_HANDLERS: dict = {
     "image-understand": handle_image_understand,
 }
 
-
 # ---------------------------------------------------------------------------
-# Optional: auto-start api_image_understanding.py
-# ---------------------------------------------------------------------------
-_api_proc: "subprocess.Popen | None" = None
-
-def _start_api_server() -> None:
-    """Launch api_image_understanding.py as a child process and wait until healthy."""
-    global _api_proc
-    from urllib.parse import urlparse
-
-    parsed = urlparse(args.api_url)
-    host = parsed.hostname or "0.0.0.0"
-    port = parsed.port or 8010
-
-    cmd = [
-        sys.executable, "api_image_understanding.py",
-        "--model_path", args.model_path,
-        "--host", host,
-        "--port", str(port),
-    ]
-    print(f"[auto-start] Launching: {' '.join(cmd)}")
-    _api_proc = subprocess.Popen(cmd)
-
-    health_url = f"{args.api_url}/health"
-    deadline = time.monotonic() + args.api_ready_timeout
-    poll_interval = 3.0
-    print(f"[auto-start] Waiting for API server to become healthy at {health_url} "
-          f"(timeout={args.api_ready_timeout}s) ...")
-    while time.monotonic() < deadline:
-        # Check if the subprocess crashed early
-        if _api_proc.poll() is not None:
-            print(f"[auto-start] API process exited unexpectedly (returncode={_api_proc.returncode}). Aborting.")
-            sys.exit(1)
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                resp = client.get(health_url)
-            if resp.status_code == 200:
-                print(f"[auto-start] API server is ready. ({resp.json()})")
-                return
-        except httpx.TransportError:
-            pass  # not up yet
-        time.sleep(poll_interval)
-
-    print(f"[auto-start] API server did not become healthy within {args.api_ready_timeout}s. Aborting.")
-    _api_proc.terminate()
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Redis worker loop
+# Redis connection
 # ---------------------------------------------------------------------------
 def _connect_redis():
     if args.redis_cluster:
-        # Azure Redis Cluster gossips internal IPs (e.g. 20.15.156.76:8501) to
-        # clients.  Those IPs are not externally reachable and the TLS cert is
-        # only valid for the public hostname.  address_remap redirects every
-        # node address back to the public endpoint so all traffic goes through
-        # the one host whose cert IS valid.
-        import ssl
+        # Azure Redis Cluster gossips internal IPs to clients; those IPs are not
+        # externally reachable and the TLS cert is only valid for the public hostname.
+        # address_remap redirects every node address back to the public endpoint.
         public_addr = (args.redis_host, args.redis_port)
-        
-        # Create SSL context that skips hostname verification for internal IPs
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_REQUIRED
-        
         return RedisCluster(
             host=args.redis_host,
             port=args.redis_port,
@@ -290,28 +364,27 @@ def _connect_redis():
         decode_responses=True,
     )
 
-
+# ---------------------------------------------------------------------------
+# Signal handling
+# ---------------------------------------------------------------------------
 _running = True
+
 
 def _on_signal(signum, _frame):
     global _running
     print(f"\nReceived signal {signum}, shutting down ...")
     _running = False
-    if _api_proc is not None and _api_proc.poll() is None:
-        print("[auto-start] Terminating API subprocess ...")
-        _api_proc.terminate()
+
 
 signal.signal(signal.SIGINT,  _on_signal)
 signal.signal(signal.SIGTERM, _on_signal)
 
-
+# ---------------------------------------------------------------------------
+# Main worker loop
+# ---------------------------------------------------------------------------
 def run_worker():
-    if args.auto_start_api:
-        _start_api_server()
-
     r = _connect_redis()
     print(f"Connected to Redis {args.redis_host}:{args.redis_port} (ssl={REDIS_SSL})")
-    print(f"API server  : {args.api_url}  (timeout={args.api_timeout}s)")
     print(f"Listening on: {args.queue_name}")
 
     while _running:
@@ -348,7 +421,7 @@ def run_worker():
                     result = {"status": "error", "error": str(exc)}
 
             elapsed = round(time.perf_counter() - t0, 3)
-            status = result.get('status')
+            status = result.get("status")
             if status == "error":
                 print(f"[{task_id}] status={status}  elapsed={elapsed}s  error={result.get('error')}")
             else:
@@ -385,6 +458,7 @@ def run_worker():
             print(traceback.format_exc())
 
     print("Worker stopped.")
+    _decode_executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
