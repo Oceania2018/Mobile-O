@@ -10,6 +10,7 @@ torchrun --nproc_per_node=1 mobileo/train/train.py \
     --deepspeed ./deepspeed_scripts/zero3.json \
     --diffusion_name_or_path Efficient-Large-Model/Sana_1600M_512px_diffusers \
     --vlm_num_layers 4 \
+    --is_train True \
     --model_name_or_path $OUTPUT_FOLDER/llava-fastvithd_1.5b_stage3 \
     --version qwen \
     --data_type mix \
@@ -31,11 +32,11 @@ torchrun --nproc_per_node=1 mobileo/train/train.py \
     --save_strategy steps \
     --save_steps 5000 \
     --save_total_limit 3 \
-    --learning_rate 5e-5 \
-    --weight_decay 0 \
-    --warmup_ratio 0.01 \
+    --learning_rate 2e-4 \
+    --weight_decay 0.01 \
+    --warmup_ratio 0.02 \
     --lr_scheduler_type cosine_with_min_lr \
-    --min_lr 1e-5 \
+    --lr_scheduler_kwargs '{"min_lr": 2e-6}' \
     --max_grad_norm 0.5 \
     --adam_beta2 0.95 \
     --model_max_length 512 \
