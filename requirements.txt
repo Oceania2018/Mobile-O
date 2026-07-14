@@ -33,3 +33,7 @@ ninja
 qwen_vl_utils
 huggingface_hub
 wandbredis
+# OpenAI-compatible HTTP endpoint (openai_server.py). gradio already pulls these
+# in transitively, but pin them explicitly so the API works without gradio too.
+fastapi
+uvicorn

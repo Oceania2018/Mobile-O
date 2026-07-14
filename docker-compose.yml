@@ -6,11 +6,10 @@ services:
       - .:/workspaces/mobile-o-inference
     working_dir: /workspaces/mobile-o-inference
     entrypoint: []
-    command: python gpu_worker.py --model_path checkpoints/final_merged_model_23620
-    environment:
-      - REDIS_ACCESS_KEY=${REDIS_ACCESS_KEY:-}
-      - REDIS_HOST=${REDIS_HOST:-rpc.centralus.redis.azure.net}
-      - REDIS_PORT=${REDIS_PORT:-10000}
+    # Serves the OpenAI-compatible HTTP API on :8400 for the llm-inference-daemon.
+    command: python gpu_worker.py --model_path checkpoints/final_merged_model_23620 --http_port 8400 --model_id mobile-o-0.5b
+    ports:
+      - "8400:8400"
     deploy:
       resources:
         reservations:
