@@ -30,6 +30,10 @@ parser.add_argument("--max_batch_images", type=int, default=8,
                     help="Max images processed per GPU batch. Larger requests are split "
                          "into chunks of this size to bound peak VRAM; the CUDA cache is "
                          "released after each task to keep the high-water mark from creeping up.")
+parser.add_argument("--enable_image_generation", action="store_true",
+                    help="Load the Sana DiT + VAE image-generation stack (~1.7 GiB VRAM). "
+                         "Off by default: this server only exposes image understanding, so "
+                         "the generation modules would sit idle in VRAM.")
 # OpenAI-compatible HTTP endpoint
 parser.add_argument("--http_port", type=int, default=8400,
                     help="Port to serve the OpenAI-compatible HTTP API on (for the "
@@ -51,6 +55,7 @@ engine = MobileOEngine(
     default_temperature=args.temperature,
     default_max_new_tokens=args.max_new_tokens,
     max_batch_images=args.max_batch_images,
+    understand_only=not args.enable_image_generation,
 )
 
 

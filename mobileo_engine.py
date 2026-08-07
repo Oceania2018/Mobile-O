@@ -1,11 +1,11 @@
 """Shared Mobile-O inference engine.
 
 Loads the Mobile-O vision-language model once and exposes image-understanding
-inference, so multiple front-ends (the Redis queue worker in ``gpu_worker.py``
-and the OpenAI-compatible HTTP server in ``openai_server.py``) can share a single
-model copy in the same process. Loading the model twice would double VRAM on the
-shared RTX 4090, so anything that needs inference builds **one** ``MobileOEngine``
-and hands it to every front-end.
+inference, so any front-end (currently the OpenAI-compatible HTTP server in
+``openai_server.py``, launched by ``gpu_worker.py``) can share a single model copy
+in the same process. Loading the model twice would double VRAM on the shared
+RTX 4090, so anything that needs inference builds **one** ``MobileOEngine`` and
+hands it to every front-end.
 
 The model-loading, prompt pre-compilation, VRAM-bounded batching and image
 decoding logic here was lifted verbatim from ``gpu_worker.py`` — behaviour is
@@ -30,7 +30,7 @@ from mobileo.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN,
                                IMAGE_TOKEN_INDEX)
 from mobileo.conversation import conv_templates
 from mobileo.mm_utils import process_images, tokenizer_image_token
-from mobileo.model import mobileoForInferenceLM
+from mobileo.model import mobileoConfig, mobileoForInferenceLM
 from mobileo.utils import disable_torch_init
 
 # Built-in fixed-prompt modes. ``prompt`` mode supplies its own text and is not
@@ -58,6 +58,7 @@ class MobileOEngine:
         default_temperature: float = 0.0,
         default_max_new_tokens: int = 64,
         max_batch_images: int = 8,
+        understand_only: bool = True,
     ):
         if device == "cuda" and not torch.cuda.is_available():
             print("WARNING: CUDA not available, falling back to CPU.")
@@ -75,8 +76,28 @@ class MobileOEngine:
         warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+
+        # mobileoConfig, not AutoConfig: config.json declares model_type
+        # "mobile_o_inference" while the registry entry is "mobileo_inference", so the
+        # Auto* lookup raises. from_pretrained() normally sidesteps this via the
+        # model's config_class — do the same here.
+        config = mobileoConfig.from_pretrained(model_path)
+        if understand_only:
+            # LlavaMetaModel builds the Sana DiT + VAE + diffusion connector for any
+            # config carrying ``diffusion_name_or_path``, and device_map="auto" parks
+            # all of it in VRAM (~1.7 GiB). Those modules are reachable only from
+            # generate_image()/sample_images(); the understanding path this server
+            # serves calls generate() with und_images and never touches them (see
+            # llava_arch.prepare_inputs_labels_for_multimodal, where the VAE is used
+            # only when gen_images is not None). Dropping the attribute skips both
+            # module construction and the corresponding weight loading, and avoids
+            # the scheduler's from_pretrained() network call at startup.
+            if hasattr(config, "diffusion_name_or_path"):
+                delattr(config, "diffusion_name_or_path")
+
         self.model = mobileoForInferenceLM.from_pretrained(
             model_path,
+            config=config,
             low_cpu_mem_usage=True,
             torch_dtype=self.dtype,
             device_map=device if device == "cpu" else "auto",
@@ -105,6 +126,9 @@ class MobileOEngine:
         self._decode_executor = ThreadPoolExecutor(max_workers=min((os.cpu_count() or 4), 8))
 
         self._warmup()
+        if device == "cuda":
+            print(f"VRAM: {torch.cuda.memory_allocated() / 2**20:.0f} MiB weights+activations, "
+                  f"{torch.cuda.memory_reserved() / 2**20:.0f} MiB reserved by the allocator")
         print("Model ready.")
 
     # ------------------------------------------------------------------

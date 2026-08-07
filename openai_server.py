@@ -14,10 +14,10 @@ so this server only has to (a) advertise its model id at ``/v1/models`` and
 (b) translate an OpenAI chat request into a Mobile-O inference call.
 
 This module does not load a model itself when embedded — it is handed an
-already-constructed :class:`mobileo_engine.MobileOEngine` so the Redis worker and
-this HTTP server share one model copy in a single process. It can also run
-standalone (``python openai_server.py --model_path ...``) for testing, which
-loads its own engine.
+already-constructed :class:`mobileo_engine.MobileOEngine`, so ``gpu_worker.py``
+keeps a single model copy in the process. It can also run standalone
+(``python openai_server.py --model_path ...``) for testing, which loads its own
+engine.
 """
 
 import logging
